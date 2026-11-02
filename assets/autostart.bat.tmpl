@@ -1,0 +1,39 @@
+@echo off
+chcp 936 >nul
+setlocal EnableExtensions
+title {{APP_NAME}} - 开机自启
+
+set "LNK=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\{{APP_NAME}}.lnk"
+
+if exist "%LNK%" goto REMOVE
+
+echo.
+echo   正在注册开机自启 ...
+powershell -NoProfile -Command "$s=New-Object -ComObject WScript.Shell; $l=$s.CreateShortcut('%LNK%'); $l.TargetPath='%~dp0启动.bat'; $l.WorkingDirectory='%~dp0'; $l.WindowStyle=7; $l.Description='{{APP_NAME}} 服务'; $l.Save()"
+
+if exist "%LNK%" (
+  echo   [OK] 已加入开机启动项：
+  echo        %LNK%
+  echo.
+  echo   说明：开机后登录该 Windows 账号时会自动启动服务（窗口隐藏）。
+  echo        再次运行本脚本可取消。
+) else (
+  echo   [失败] 创建快捷方式失败，请检查权限。
+)
+echo.
+pause
+exit /b 0
+
+:REMOVE
+echo.
+echo   检测到已存在开机启动项，正在取消 ...
+del /q "%LNK%" >nul 2>nul
+if exist "%LNK%" (
+  echo   [失败] 删除失败，请手动删除：
+  echo        %LNK%
+) else (
+  echo   [OK] 已取消开机自启。
+)
+echo.
+pause
+exit /b 0

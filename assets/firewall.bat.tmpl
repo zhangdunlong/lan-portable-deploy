@@ -1,0 +1,51 @@
+@echo off
+chcp 936 >nul
+setlocal EnableExtensions
+title {{APP_NAME}} - 放行防火墙端口
+
+echo.
+echo   ============================================================
+echo       {{APP_NAME}} - 让局域网其他电脑能访问
+echo   ============================================================
+echo.
+
+REM 需要管理员权限才能改防火墙规则
+net session >nul 2>&1
+if errorlevel 1 (
+  echo   [失败] 需要管理员权限。
+  echo   请右键本文件 -^> 「以管理员身份运行」。
+  echo.
+  pause
+  exit /b 1
+)
+
+set "PORT={{DEFAULT_PORT}}"
+if exist "%~dp0_port.txt" set /p PORT=<"%~dp0_port.txt"
+
+echo   当前服务端口：%PORT%
+echo   正在添加入站规则 ...
+echo.
+
+netsh advfirewall firewall delete rule name="{{APP_NAME}} (TCP %PORT%)" >nul 2>nul
+netsh advfirewall firewall add rule name="{{APP_NAME}} (TCP %PORT%)" dir=in action=allow protocol=TCP localport=%PORT% profile=any >nul
+if errorlevel 1 (
+  echo   [失败] 添加规则失败，请确认是用管理员身份运行的。
+) else (
+  echo   [OK] 已放行入站 TCP %PORT%（所有网络类型）
+)
+
+REM 同时按程序放行，覆盖「按端口规则不生效」的老系统
+if exist "%~dp0{{RUNTIME_REL}}" (
+  netsh advfirewall firewall delete rule name="{{APP_NAME}} (程序)" >nul 2>nul
+  netsh advfirewall firewall add rule name="{{APP_NAME}} (程序)" dir=in action=allow program="%~dp0{{RUNTIME_REL}}" enable=yes profile=any >nul
+  echo   [OK] 已放行程序 {{RUNTIME_REL}}
+)
+
+echo.
+echo   本机地址：
+ipconfig | findstr /i "IPv4"
+echo.
+echo   其他电脑用上面的 IPv4 地址访问：http://地址:端口
+echo   （端口是 %PORT%，如果等于 80 就不用写端口号）
+echo.
+pause

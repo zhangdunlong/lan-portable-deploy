@@ -1,0 +1,19 @@
+# 构建产物
+dist/
+部署包/
+_build_*/
+_部署包_*/
+
+# 便携运行时不入库（体积大，按需自行放置或随部署包分发）
+runtime/
+*.exe
+
+# Python
+__pycache__/
+*.pyc
+
+# 本地临时文件
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

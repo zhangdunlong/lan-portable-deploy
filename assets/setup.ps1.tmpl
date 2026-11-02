@@ -1,0 +1,646 @@
+# =============================================================================
+#  {{APP_NAME}} — 一键升级 / 安装脚本
+# -----------------------------------------------------------------------------
+#  由 build-deploy.js 打进部署包，在工厂 PC 上运行。
+#  职责：
+#    ① 定位点检系统的安装目录（自动探测，首次可手选，之后写入注册表记住）
+#    ② 备份现有 {{ENTRY_FILE}} + public/ 到 _升级备份_<时间戳>/
+#    ③ 停止正在运行的服务（按 {{DEFAULT_PORT}} 端口精确定位）
+#    ④ 覆盖 {{ENTRY_FILE}} + public/（{{DATA_MARK}} 绝对不动）
+#    ⑤ 重新拉起服务（隐藏窗口，与「启动.bat」同款方式）
+#    ⑥ 等端口就绪 + 读 /api/version 校验版本
+#    ⑦ 失败自动回滚
+#
+#  用法：
+#    powershell -ExecutionPolicy Bypass -File _setup.ps1
+#    powershell -ExecutionPolicy Bypass -File _setup.ps1 -Target "D:\点检系统"
+#    powershell -ExecutionPolicy Bypass -File _setup.ps1 -Port 9000      # 服务不在默认端口时
+#    powershell -ExecutionPolicy Bypass -File _setup.ps1 -NoRestart      # 只更文件不重启
+#    powershell -ExecutionPolicy Bypass -File _setup.ps1 -DryRun         # 只看会做什么，不落盘
+#
+#  -Detached / -LogFile 是内部参数，由本脚本自派时自动带上，正常使用不需要手动传：
+#    脚本会先把自己派生成一个独立进程再干活，避免被调用方的死亡「连坐」（详见下方自派说明）。
+#
+#  本文件必须保存为 UTF-8 with BOM，否则 Windows PowerShell 5.1 里中文会乱码。
+# =============================================================================
+[CmdletBinding()]
+param(
+  [string]$Source = '',              # 升级文件所在目录；留空 = 本脚本所在目录
+  [string]$Target = '',              # 目标安装目录；留空则自动探测
+  [int]$Port = 0,                    # 服务端口；0 = 自动（读 _port.txt，否则默认 {{DEFAULT_PORT}}）
+  [switch]$NoRestart,
+  [switch]$DryRun,
+  [switch]$AutoOpen,                 # 完成后自动打开浏览器
+  [switch]$Detached,                 # 内部使用：本进程已是「被自派出来的独立进程」，不再二次自派
+  [string]$LogFile = ''              # 内部使用：自派时用来给子进程做输出重定向的日志文件
+)
+
+# 坑：不能在 param() 的默认值里写 $PSScriptRoot —— 那一行在脚本作用域初始化之前求值，
+# 拿到的是空字符串，随后 Join-Path 会抛「参数 Path 为空字符串」。必须在脚本体内取。
+if ([string]::IsNullOrWhiteSpace($Source)) { $Source = $PSScriptRoot }
+
+# 支持「把目标目录直接拖到安装包/bat 图标上」：bat 会把 %~1 放进 EQ_TARGET
+if ([string]::IsNullOrWhiteSpace($Target) -and -not [string]::IsNullOrWhiteSpace($env:EQ_TARGET)) {
+  $Target = $env:EQ_TARGET
+}
+
+# 端口解析顺序：-Port 显式传入 > 安装目录的 _port.txt（启动.bat 记录的实际端口）> 默认 {{DEFAULT_PORT}}
+# 为什么要有这一步：80 被占用时启动脚本会改用 8080，升级若还按 80 去停服/校验，
+# 结果必然是「升级看起来成功、版本号却没变」，甚至误杀别的进程。
+if ($Port -le 0) {
+  $Port = {{DEFAULT_PORT}}
+  $portCands = @()
+  if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $portCands += (Join-Path $PSScriptRoot '_port.txt') }
+  if (-not [string]::IsNullOrWhiteSpace($Target)) { $portCands += (Join-Path $Target '_port.txt') }
+  foreach ($pf in $portCands) {
+    if (Test-Path -LiteralPath $pf) {
+      $pv = 0
+      $raw = (Get-Content -LiteralPath $pf -Raw -ErrorAction SilentlyContinue)
+      if ($raw -and [int]::TryParse($raw.Trim(), [ref]$pv) -and $pv -gt 0) { $Port = $pv; break }
+    }
+  }
+}
+
+$ErrorActionPreference = 'Stop'
+# 端口来自 -Port（默认 {{DEFAULT_PORT}}）。停服与校验都按它精确定位，避免误杀别的 node 进程。
+$PORT      = $Port
+$REG_PATH  = 'HKCU:\Software\{{REG_SLUG}}'
+$PKG_FILES = @('{{ENTRY_FILE}}', '{{STATIC_DIR}}', '启动.bat', '停止.bat', '_run_hidden.vbs')
+
+# ---------------------------------------------------------------- 输出助手
+function Say  ($m, $c = 'Gray') { Write-Host $m -ForegroundColor $c }
+function Head ($m) { Write-Host ''; Write-Host $m -ForegroundColor Cyan; Write-Host ('-' * 58) -ForegroundColor DarkGray }
+function Ok   ($m) { Write-Host "  [OK]   $m" -ForegroundColor Green }
+function Warn ($m) { Write-Host "  [注意] $m" -ForegroundColor Yellow }
+function Fail ($m) { Write-Host "  [失败] $m" -ForegroundColor Red }
+
+# ---------------------------------------------------------------- 自派（脱离调用方）
+# 【踩过坑·关键】远程升级时，本引擎是「目标机 node 服务进程」spawn 出来的子进程，
+# 而 Windows 上 node 直接 spawn 的子进程会被连坐 —— 三组对照实验实测结果：
+#   ① node 被外部杀掉            → 它 spawn 的子 PowerShell 约 1 秒后一起消失；
+#   ② 子 PowerShell 亲手 Stop-Process 杀掉 node → 它自己也在 1 秒后消失
+#      （现场日志正好停在「④ 停止服务」，后面的覆盖 / 重启 / 写日志全都「没跑过」）；
+#   ③ 由 PowerShell 再用 Start-Process 派生出的「孙进程」→ 完全不受影响，跑完全程。
+# 所以引擎要做的第一件事，就是把活重新派给一个独立进程，自己立刻退出交棒。
+if (-not $Detached) {
+  $self = $PSCommandPath
+  if ([string]::IsNullOrWhiteSpace($self)) { $self = $MyInvocation.MyCommand.Path }
+  if ([string]::IsNullOrWhiteSpace($self) -or -not (Test-Path -LiteralPath $self)) {
+    Fail '取不到本脚本自身的路径，无法自派独立升级进程'
+    exit 1
+  }
+
+  # 日志：没指定就落到安装目录（能进去的话），否则退到 %TEMP%
+  if ([string]::IsNullOrWhiteSpace($LogFile)) {
+    $logDir = $env:TEMP
+    if (-not [string]::IsNullOrWhiteSpace($Target) -and (Test-Path -LiteralPath $Target)) { $logDir = $Target }
+    $LogFile = Join-Path $logDir '升级引擎运行日志.txt'
+  }
+  # Start-Process 的重定向是「覆盖」写：先把上一轮日志挪成 .1 留档，
+  # 保证固定文件里永远是最近一轮，同时不至于把历史全丢掉。
+  try {
+    if (Test-Path -LiteralPath $LogFile) { Move-Item -LiteralPath $LogFile -Destination ($LogFile + '.1') -Force }
+  } catch { }
+
+  $redo = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $self,
+            '-Source', $Source, '-Port', "$Port", '-Detached', '-LogFile', $LogFile)
+  if (-not [string]::IsNullOrWhiteSpace($Target)) { $redo += @('-Target', $Target) }
+  if ($NoRestart) { $redo += '-NoRestart' }
+  if ($DryRun)    { $redo += '-DryRun' }
+  if ($AutoOpen)  { $redo += '-AutoOpen' }
+
+  # 【踩过坑·实测】环境里同时存在 http_proxy 与 HTTP_PROXY 时，Start-Process 会抛
+  # 「已添加项。字典中的关键字:'http_proxy' 所添加的关键字:'HTTP_PROXY'」而完全无法自派。
+  # 这是 Windows PowerShell 5.1 的已知行为（进程环境按大小写不敏感字典复制）。
+  # 公司网络里装了代理工具、又手工设过环境变量的机器很容易命中，所以自派前先去重。
+  foreach ($n in @('http_proxy', 'https_proxy', 'no_proxy', 'all_proxy')) {
+    $up = $n.ToUpper()
+    if ($null -ne [Environment]::GetEnvironmentVariable($n) -and $null -ne [Environment]::GetEnvironmentVariable($up)) {
+      Remove-Item -LiteralPath ('Env:' + $n) -ErrorAction SilentlyContinue
+      Say ("  （已清理大小写重复的环境变量 " + $n + "，否则 Start-Process 无法自派）") -c DarkGray
+    }
+  }
+
+  # 实测 -WindowStyle Hidden 与 -RedirectStandardOutput/-RedirectStandardError 可以共存
+  # （两个重定向目标不能是同一个文件，所以 stderr 走 .err 后缀）。
+  try {
+    $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') `
+      -ArgumentList $redo -WindowStyle Hidden -PassThru `
+      -RedirectStandardOutput $LogFile -RedirectStandardError ($LogFile + '.err')
+    Say ''
+    Say "  已派出独立升级进程 PID=$($child.Id)、已脱离调用方（不会被连坐终止）" -c Cyan
+    Say "  运行日志：$LogFile"
+    Say ''
+    # 真正干活的子进程是隐藏窗口，本地双击升级时用户会以为"窗口一闪就没了"。
+    # 这里把子进程的日志「转播」到本窗口，进度照旧可见（读不到就静默跳过，不影响升级）。
+    $shown = 0
+    while (-not $child.HasExited) {
+      Start-Sleep -Milliseconds 400
+      try {
+        $txt = [IO.File]::ReadAllText($LogFile, [Text.Encoding]::UTF8)
+        if ($txt.Length -gt $shown) {
+          $chunk = $txt.Substring($shown).TrimEnd("`r", "`n")
+          $shown = $txt.Length
+          if ($chunk.Trim()) { Write-Host $chunk }
+        }
+      } catch { }
+    }
+    Start-Sleep -Milliseconds 300
+    try {
+      $txt = [IO.File]::ReadAllText($LogFile, [Text.Encoding]::UTF8)
+      if ($txt.Length -gt $shown) {
+        $chunk = $txt.Substring($shown).TrimEnd("`r", "`n")
+        if ($chunk.Trim()) { Write-Host $chunk }
+      }
+    } catch { }
+  } catch {
+    Fail "自派独立升级进程失败：$($_.Exception.Message)"
+    exit 1
+  }
+  exit 0
+}
+
+# 走到这里 = 本进程就是被自派出来的独立进程。
+# 【踩过坑】本进程的输出总是被 Start-Process 重定向进日志文件（自己没有可见控制台），
+# 而 PowerShell 5.1 默认按系统 ANSI(GBK) 落盘 —— 用 UTF-8 编辑器打开 apply.log 就是乱码。
+# 这份日志是远程升级失败时人不在现场的唯一线索，必须能被任何工具正常读。
+try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false) } catch { }
+
+# 先把「我是谁、谁派的、什么参数」写进日志头部
+Say '============================================================'
+Say " 独立升级进程 PID=$PID   启动于 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+Say '============================================================'
+Say "  来源目录：$Source"
+if (-not [string]::IsNullOrWhiteSpace($Target)) { Say "  目标目录：$Target" }
+# 注意：不能写成 Say "…" + $x —— 那个 + 会被当成本函数的第 2 个位置参数（$c 是颜色），
+# 报「无法绑定参数 ForegroundColor」，在 Stop 策略下直接把引擎打断。先拼好再传。
+$sw = ''
+if ($NoRestart) { $sw += '   （-NoRestart：只更文件不重启）' }
+if ($DryRun)    { $sw += '   （-DryRun：预演，不落盘）' }
+Say ("  服务端口：$PORT" + $sw)
+Say '  说明    ：本进程由调用方自派，已脱离原服务进程，不会被连坐终止。'
+Say ''
+
+# ---------------------------------------------------------------- 0. 自检
+if (-not (Test-Path (Join-Path $Source '{{ENTRY_FILE}}'))) {
+  Fail "升级源目录里找不到 {{ENTRY_FILE}}：$Source"
+  Say '  请把本脚本与 {{ENTRY_FILE}}、public 放在同一个目录后再运行。'
+  exit 1
+}
+$pkgVersion = 'unknown'
+$vf = Join-Path $Source 'version.txt'
+if (Test-Path $vf) {
+  $pkgVersion = (Get-Content -LiteralPath $vf -Raw -Encoding UTF8).Trim().Split("`n")[0].Trim()
+}
+
+Say ''
+Say '  ============================================================' -c Cyan
+Say '            {{APP_NAME}}   一键升级 / 安装' -c Cyan
+Say '  ============================================================' -c Cyan
+Say ''
+Say "  升级包版本：$pkgVersion"
+Say "  文件来源  ：$Source"
+
+# ---------------------------------------------------------------- 1. 定位安装目录
+# 【重要·踩过坑】一键升级 bat 会把升级包释放到 %TEMP%\\eq_upgrade_pkg 再运行本脚本，
+# 而那个目录里同样有 {{ENTRY_FILE}} / public —— 如果把它当成安装目录，紧接着
+# Copy-Item 会把文件覆盖到自己身上（PowerShell 直接抛 "with itself"），安装必然失败。
+# 所以：① 临时目录里的路径一律不作候选；② 用打分制挑「最像真系统目录」的那个。
+function Test-IsTempPath {
+  param([string]$Path)
+  if ([string]::IsNullOrWhiteSpace($Path)) { return $true }
+  $full = ''
+  try { $full = [IO.Path]::GetFullPath($Path).TrimEnd('\') } catch { return $false }
+  $cands = @()
+  foreach ($e in @($env:TEMP, $env:TMP)) { if (-not [string]::IsNullOrWhiteSpace($e)) { $cands += $e } }
+  if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { $cands += (Join-Path $env:LOCALAPPDATA 'Temp') }
+  foreach ($c in $cands) {
+    $cf = ''
+    try { $cf = [IO.Path]::GetFullPath($c).TrimEnd('\') } catch { continue }
+    if ($full -ieq $cf) { return $true }
+    if ($full.StartsWith($cf + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+  }
+  return $false
+}
+
+# 安装目录评分（越像真系统目录分越高）：
+#   {{RUNTIME_REL}}  +5   自带便携 Node —— 只有真正装好的机器才有
+#   {{DATA_MARK}}      +4   有真实点检数据 —— 铁证
+#   {{ENTRY_FILE}}/public  +1   升级包和系统目录都有，权重必须低
+function Get-InstallScore {
+  param([string]$Path)
+  if ([string]::IsNullOrWhiteSpace($Path)) { return -1 }
+  if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return -1 }
+  if (Test-IsTempPath $Path) { return -1 }          # 临时目录直接判死刑
+  $s = 0
+  if (Test-Path -LiteralPath (Join-Path $Path '{{RUNTIME_REL}}'))  { $s += 5 }
+  if (Test-Path -LiteralPath (Join-Path $Path '{{DATA_MARK}}'))      { $s += 4 }
+  if (Test-Path -LiteralPath (Join-Path $Path '{{ENTRY_FILE}}'))         { $s += 1 }
+  if (Test-Path -LiteralPath (Join-Path $Path ('{{STATIC_DIR}}\index.html'))) { $s += 1 }
+  if (Test-Path -LiteralPath (Join-Path $Path '启动.bat'))           { $s += 1 }
+  return $s
+}
+
+function Test-InstallDir {
+  param([string]$Path)
+  return ((Get-InstallScore $Path) -ge 2)
+}
+
+function Find-InstallDir {
+  # ① 注册表里记住的上次安装位置（最可靠）
+  try {
+    if (Test-Path $REG_PATH) {
+      $r = (Get-ItemProperty -Path $REG_PATH -Name InstallDir -ErrorAction SilentlyContinue).InstallDir
+      if (Test-InstallDir $r) { return @{ Dir = $r; How = '上次安装位置（注册表记录）' } }
+    }
+  } catch { }
+
+  # ② 脚本自身所在目录 / 上一级（仅「人工把包解压到系统目录」这种用法成立）
+  if (Test-IsTempPath $PSScriptRoot) {
+    Say '  （本包运行在临时目录，已跳过"包内目录"候选）' -c DarkGray
+  } else {
+    if (Test-InstallDir $PSScriptRoot) { return @{ Dir = $PSScriptRoot; How = '升级包已解压到系统目录内' } }
+    $up = Split-Path $PSScriptRoot -Parent
+    if (Test-InstallDir $up) { return @{ Dir = $up; How = '系统目录在升级包的上一级' } }
+  }
+
+  # ③ 常见位置扫描：桌面、用户目录、各盘根，往下 2 层，取评分最高的那个
+  $roots = @()
+  foreach ($n in @('Desktop', 'UserProfile')) {
+    try { $roots += [Environment]::GetFolderPath($n) } catch { }
+  }
+  foreach ($d in @('C:\', 'D:\', 'E:\', 'F:\')) { if (Test-Path $d) { $roots += $d } }
+  $roots = $roots | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+
+  $skip = @('Windows', 'Program Files', 'Program Files (x86)', 'ProgramData', 'AppData',
+            'Users', '$Recycle.Bin', 'System Volume Information', 'Recovery', 'PerfLogs',
+            'MSOCache', 'Documents and Settings', '$WinREAgent', 'node_modules', '.git',
+            'Temp', 'Windows.old', 'System32', 'SysWOW64')
+
+  $best = $null; $bestScore = 0
+  foreach ($r in $roots) {
+    if (Test-IsTempPath $r) { continue }
+    $s0 = Get-InstallScore $r
+    if ($s0 -gt $bestScore) { $bestScore = $s0; $best = @{ Dir = $r; How = "自动扫描：$r" } }
+    $lv1 = Get-ChildItem -LiteralPath $r -Directory -ErrorAction SilentlyContinue |
+           Where-Object { $skip -notcontains $_.Name }
+    foreach ($d1 in $lv1) {
+      $s1 = Get-InstallScore $d1.FullName
+      if ($s1 -gt $bestScore) { $bestScore = $s1; $best = @{ Dir = $d1.FullName; How = "自动扫描：$r" } }
+      $lv2 = Get-ChildItem -LiteralPath $d1.FullName -Directory -ErrorAction SilentlyContinue |
+             Where-Object { $skip -notcontains $_.Name }
+      foreach ($d2 in $lv2) {
+        $s2 = Get-InstallScore $d2.FullName
+        if ($s2 -gt $bestScore) { $bestScore = $s2; $best = @{ Dir = $d2.FullName; How = "自动扫描：$r" } }
+      }
+    }
+  }
+  if ($best -and $bestScore -ge 2) { return $best }
+
+  # ④ 让用户手选（全新安装、或系统装在很深的目录时会走到这里）
+  try {
+    Add-Type -AssemblyName System.Windows.Forms | Out-Null
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = '请选择「{{APP_NAME}}」的目录（里面有 启动.bat / {{ENTRY_FILE}}）；全新安装就选一个空目录'
+    $dlg.ShowNewFolderButton = $true
+    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+      return @{ Dir = $dlg.SelectedPath; How = '手动选择' }
+    }
+  } catch {
+    Warn "文件夹选择框打不开：$($_.Exception.Message)"
+  }
+
+  return $null
+}
+
+Head '① 定位安装目录'
+$found = $null
+if (-not [string]::IsNullOrWhiteSpace($Target)) {
+  # 用户明确给了目录：只要存在就用它（全新安装时目录是空的，不能用 Test-InstallDir 卡掉）
+  if (Test-Path -LiteralPath $Target -PathType Container) {
+    $found = @{ Dir = (Resolve-Path -LiteralPath $Target).Path; How = '指定目录' }
+  } else {
+    Warn "指定的目录不存在：$Target —— 改为自动探测"
+  }
+}
+if (-not $found) { $found = Find-InstallDir }
+if (-not $found) {
+  Fail '没有找到点检系统的安装目录。'
+  Say '  解决办法（任选一种）：'
+  Say '    ① 把目标目录直接拖到本安装包上再运行（拖放即指定目录）'
+  Say '    ② 把本升级包直接解压到点检系统目录里再运行'
+  Say '    ③ 手动指定目录：'
+  Say '       powershell -ExecutionPolicy Bypass -File setup.ps1 -Target "D:\你的路径"'
+  exit 1
+}
+$T = $found.Dir
+Ok "安装目录：$T"
+Say "      （定位方式：$($found.How)）"
+
+# ---------------------------------------------------------------- 2. 现状快照
+Head '② 检查现状'
+$oldVersion = '未安装'
+$sf = Join-Path $T '{{ENTRY_FILE}}'
+if (Test-Path $sf) {
+  $m = Select-String -LiteralPath $sf -Pattern "APP_VERSION\s*=\s*'([^']+)'" -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($m -and $m.Matches.Count -gt 0) { $oldVersion = $m.Matches[0].Groups[1].Value }
+}
+Say "  当前版本：$oldVersion"
+Say "  升级版本：$pkgVersion"
+
+$hasRuntime = Test-Path (Join-Path $T '{{RUNTIME_REL}}')
+if ($hasRuntime) { Ok '运行时：{{RUNTIME_REL}}（自带便携 Node）' }
+else {
+  $sysNode = Get-Command node -ErrorAction SilentlyContinue
+  if ($sysNode) { Warn "没有自带 {{RUNTIME_REL}}，将使用系统 Node：$($sysNode.Source)" }
+  else {
+    Fail '既没有 {{RUNTIME_REL}}，系统里也没装 Node.js —— 装完服务也起不来。'
+    Say '  解决办法（二选一）：'
+    Say '    ① 把原系统在用的 {{RUNTIME_REL}} 拷到本目录的 runtime\ 下（推荐，版本一致）'
+    Say '    ② 在目标机安装 Node.js，或改用带运行时的完整包'
+    if (-not $DryRun) { exit 1 }
+  }
+}
+
+$listener = $null
+try {
+  $listener = Get-NetTCPConnection -LocalPort $PORT -State Listen -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty OwningProcess -Unique
+} catch { }
+if ($listener) { Say "  服务状态：正在运行（PID $($listener -join ',')）" }
+else { Say '  服务状态：未运行' }
+
+$kv = Join-Path $T '{{DATA_MARK}}'
+if (Test-Path $kv) {
+  $kvSize = [math]::Round((Get-Item $kv).Length / 1KB, 1)
+  Ok "数据文件 {{DATA_MARK}} 已存在（$kvSize KB）—— 本次升级【不会】触碰它"
+} else { Warn '安装目录里还没有 {{DATA_MARK}}（首次安装会新建空库）' }
+
+if ($DryRun) {
+  Say ''
+  Warn '这是 DryRun 模式：以上为将要执行的动作，未改动任何文件。'
+  exit 0
+}
+
+# ---------------------------------------------------------------- 3. 备份
+Head '③ 备份现有程序'
+$stamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
+$backup = Join-Path $T "_升级备份_$stamp"
+New-Item -ItemType Directory -Force -Path $backup | Out-Null
+foreach ($f in @('{{ENTRY_FILE}}', '{{STATIC_DIR}}')) {
+  $src = Join-Path $T $f
+  if (Test-Path $src) { Copy-Item -LiteralPath $src -Destination $backup -Recurse -Force; }
+}
+$bkCount = (Get-ChildItem -LiteralPath $backup -Recurse -File -ErrorAction SilentlyContinue).Count
+Ok "已备份到：$backup（$bkCount 个文件）"
+
+# ---------------------------------------------------------------- 4. 停服务
+Head '④ 停止服务'
+if ($listener) {
+  foreach ($procId in $listener) {
+    try { Stop-Process -Id $procId -Force -ErrorAction Stop; Ok "已停止进程 PID $procId" }
+    catch { Warn "停止 PID $procId 失败：$($_.Exception.Message)" }
+  }
+  Start-Sleep -Milliseconds 800
+  $still = $null
+  try { $still = Get-NetTCPConnection -LocalPort $PORT -State Listen -ErrorAction SilentlyContinue } catch { }
+  if ($still) { Warn "端口 $PORT 仍被占用，尝试结束 node.exe ..."; taskkill /f /im node.exe 2>&1 | Out-Null; Start-Sleep -Milliseconds 800 }
+} else {
+  Say '  服务本来就没运行，跳过。'
+}
+
+# ---------------------------------------------------------------- 5. 覆盖文件
+Head '⑤ 写入新版本文件'
+$done = @()
+try {
+  Copy-Item -LiteralPath (Join-Path $Source '{{ENTRY_FILE}}') -Destination (Join-Path $T '{{ENTRY_FILE}}') -Force
+  Ok '{{ENTRY_FILE}} 已更新'
+  $done += '{{ENTRY_FILE}}'
+
+  # public：先拷成 .__new__，成功后再原子替换，避免拷一半把站点毁了
+  $newPub = Join-Path $T '{{STATIC_DIR}}.__new__'
+  if (Test-Path $newPub) { Remove-Item -LiteralPath $newPub -Recurse -Force }
+  Copy-Item -LiteralPath (Join-Path $Source '{{STATIC_DIR}}') -Destination $newPub -Recurse -Force
+  $oldPub = Join-Path $T '{{STATIC_DIR}}'
+  if (Test-Path $oldPub) { Remove-Item -LiteralPath $oldPub -Recurse -Force }
+  Rename-Item -LiteralPath $newPub -NewName '{{STATIC_DIR}}'
+  $fileCount = (Get-ChildItem -LiteralPath (Join-Path $T '{{STATIC_DIR}}') -Recurse -File).Count
+  Ok "{{STATIC_DIR}}\ 已更新（$fileCount 个文件）"
+  $done += '{{STATIC_DIR}}'
+
+  # 启动脚本只在目标机缺失时才补（首次安装用），已有的一律不动
+  foreach ($f in @('启动.bat', '停止.bat', '_run_hidden.vbs')) {
+    $dst = Join-Path $T $f
+    $src = Join-Path $Source $f
+    if ((Test-Path $src) -and -not (Test-Path $dst)) {
+      Copy-Item -LiteralPath $src -Destination $dst -Force
+      Ok "补齐缺失的启动脚本：$f"
+    }
+  }
+} catch {
+  Fail "写入失败：$($_.Exception.Message)"
+  Say '  正在回滚 ...' -c Yellow
+  foreach ($f in @('{{ENTRY_FILE}}', '{{STATIC_DIR}}')) {
+    $b = Join-Path $backup $f
+    if (Test-Path $b) {
+      $d = Join-Path $T $f
+      if (Test-Path $d) { Remove-Item -LiteralPath $d -Recurse -Force }
+      Copy-Item -LiteralPath $b -Destination $d -Recurse -Force
+    }
+  }
+  $stray = Join-Path $T '{{STATIC_DIR}}.__new__'
+  if (Test-Path $stray) { Remove-Item -LiteralPath $stray -Recurse -Force }
+  Warn '已回滚到升级前的文件。'
+  exit 1
+}
+
+# ---------------------------------------------------------------- 5.5 升级后钩子（可选）
+# 【为什么保留这个扩展点】包内按设计不带 {{DATA_DIR}}/ —— 数据在目标机自己那儿，升级从不覆盖。
+# 代价是「新增的配置/字典/模板」不会随包自动进去。约定放一个幂等钩子脚本补齐：
+#   包内路径：tools\deploy\post-upgrade.js   调用方式：node post-upgrade.js <安装目录>
+# 三条要求：① 幂等（重复跑结果一样）② 只增不改 ③ 失败不影响升级结果。
+Head '⑤·补 执行升级后钩子（可选）'
+try {
+  $hookJs = Join-Path $Source 'tools\deploy\post-upgrade.js'
+  if (Test-Path $hookJs) {
+    $hookNode = Join-Path $T '{{RUNTIME_REL}}'
+    if (-not (Test-Path $hookNode)) { $hookNode = '{{RUNTIME_EXE_NAME}}' }
+    $hookOut = (& $hookNode $hookJs $T 2>&1 | Out-String)
+    foreach ($ln in ($hookOut -split "`r?`n")) { if ($ln.Trim()) { Say ('  ' + $ln.Trim()) } }
+    if ($hookOut -match '\[错误\]') { Warn '钩子报告了错误，请看上面输出' }
+    else { Ok '升级后钩子已执行（只补缺失项，未改动既有数据）' }
+  } else {
+    Say '  包内没有升级后钩子，跳过。'
+  }
+} catch {
+  Warn "升级后钩子出错（已跳过，不影响升级）：$($_.Exception.Message)"
+}
+
+# ---------------------------------------------------------------- 6. 重启服务
+# 把「启动服务」抽成函数：回滚之后还要再启动一次旧版本。
+function Start-EqService {
+  # 清掉上次「停止.bat」留下的停止标志，否则守护进程一起来就自己退了
+  $sf = Join-Path $T '_stop.flag'
+  if (Test-Path -LiteralPath $sf) { Remove-Item -LiteralPath $sf -Force -ErrorAction SilentlyContinue }
+  # 【踩过坑·关键】重启用的是「直接拉起 node {{ENTRY_FILE}}」这条路，不经过「启动.bat」——
+  # 而端口正是在「启动.bat」里用 set PORT=... 设定的。自定义过端口的机器，升级后服务会
+  # 悄悄回到默认 {{DEFAULT_PORT}}，紧接着第 7 步的在线校验必然失败并触发回滚；从外面看到的现象是
+  # 「提示升级成功，但版本号没变」。这里显式把端口写进环境变量，子进程（wscript/node）都会继承。
+  $env:PORT = "$PORT"
+  $nodeExe = Join-Path $T '{{RUNTIME_REL}}'
+  if (-not (Test-Path $nodeExe)) { $nodeExe = 'node' }
+  $vbs = Join-Path $T '_run_hidden.vbs'
+  $srv = Join-Path $T '{{ENTRY_FILE}}'
+  $wd = Join-Path $T 'watchdog.js'
+  if ((Test-Path $vbs) -and (Test-Path $wd)) {
+    # 有守护进程就交给它拉服务：崩溃自动重启、日志落盘
+    Start-Process -FilePath 'wscript.exe' -ArgumentList @("`"$vbs`"", "`"$nodeExe`"", "`"$wd`"", "`"$srv`"") -WindowStyle Hidden
+  } elseif (Test-Path $vbs) {
+    Start-Process -FilePath 'wscript.exe' -ArgumentList @("`"$vbs`"", "`"$nodeExe`"", "`"$srv`"") -WindowStyle Hidden
+  } else {
+    Start-Process -FilePath $nodeExe -ArgumentList @("`"$srv`"") -WorkingDirectory $T -WindowStyle Hidden
+  }
+}
+
+# 捞一次在线版本号（空字符串 = 起不来）
+function Get-EqLiveVersion {
+  param([int]$Tries = 20)
+  $wc = New-Object System.Net.WebClient
+  $wc.Proxy = $null                     # 关键：绕开系统代理，否则 127.0.0.1 会被劫持
+  $wc.Encoding = [Text.Encoding]::UTF8
+  for ($i = 1; $i -le $Tries; $i++) {
+    Start-Sleep -Milliseconds 700
+    try {
+      $j = $wc.DownloadString("http://127.0.0.1:$PORT/api/version") | ConvertFrom-Json
+      if ($j.version) { return "$($j.version)" }
+    } catch { }
+  }
+  return ''
+}
+
+# 回滚：还原 {{ENTRY_FILE}} + public，并按需要把旧版服务重新拉起来。
+# 【为什么必须有】局域网远程升级是无人值守的：新版本若起不来，机器会停在「服务不可用」，
+# 只能有人跑一趟现场。有了回滚，最坏情况也只是回到升级前的样子。
+function Invoke-Rollback {
+  param([switch]$Restart)
+  foreach ($f in @('{{ENTRY_FILE}}', '{{STATIC_DIR}}')) {
+    $b = Join-Path $backup $f
+    if (Test-Path $b) {
+      $d = Join-Path $T $f
+      if (Test-Path $d) { Remove-Item -LiteralPath $d -Recurse -Force }
+      Copy-Item -LiteralPath $b -Destination $d -Recurse -Force
+    }
+  }
+  $stray = Join-Path $T '{{STATIC_DIR}}.__new__'
+  if (Test-Path $stray) { Remove-Item -LiteralPath $stray -Recurse -Force }
+  if ($Restart) { Start-EqService }
+}
+
+Head '⑥ 启动服务'
+if ($NoRestart) {
+  Warn '按 -NoRestart 要求，没有自动启动。请手动双击「启动.bat」。'
+} else {
+  Start-EqService
+  if (Test-Path (Join-Path $T '_run_hidden.vbs')) { Ok '已通过 _run_hidden.vbs 后台启动（无窗口）' }
+  else { Ok '已后台启动 node {{ENTRY_FILE}}' }
+}
+
+# ---------------------------------------------------------------- 7. 校验
+Head '⑦ 校验'
+$live = ''
+$rolledBack = $false
+if (-not $NoRestart) { $live = Get-EqLiveVersion }
+
+if ($live) {
+  Ok "服务已就绪，接口返回版本：$live"
+  if ($live -eq $pkgVersion) { Ok '版本号与升级包一致 —— 升级成功' }
+  else { Warn "版本号与升级包不一致（包内 $pkgVersion）—— 版本号是覆盖成功的直接证据，请确认后重试" }
+  # 端口已确认在服务；业务接口自检按项目实际情况补充（不要默认假设存在特定接口）
+} elseif ($NoRestart) {
+  Warn '没有自动启动服务（-NoRestart），跳过在线校验。请手动双击「启动.bat」。'
+} else {
+  Fail "新版本服务在 14 秒内没有起来（端口 $PORT）。"
+  if (-not (Test-Path (Join-Path $backup '{{ENTRY_FILE}}'))) {
+    Fail '没有可回滚的备份（首次安装或备份为空），请手动检查 server.log'
+  } else {
+    Warn '正在自动回滚到升级前的版本 ...'
+    Invoke-Rollback -Restart
+    $rolledBack = $true
+    $back = Get-EqLiveVersion
+    if ($back) {
+      Warn "已回滚：服务恢复运行，当前版本 $back（本次没有升级成功）"
+      Say '  请把这个升级包反馈给维护者 —— 它在这台机器上起不来。' -c Yellow
+    } else {
+      Fail '回滚后服务仍然起不来，请到这台机器上双击「启动.bat」并查看 server.log'
+    }
+  }
+}
+
+# ---------------------------------------------------------------- 8. 收尾
+try {
+  New-Item -Path $REG_PATH -Force | Out-Null
+  Set-ItemProperty -Path $REG_PATH -Name InstallDir -Value $T
+  Set-ItemProperty -Path $REG_PATH -Name LastVersion -Value $live
+  Set-ItemProperty -Path $REG_PATH -Name LastUpgrade  -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+  Ok '已记住安装位置，下次升级可全自动定位'
+} catch { Warn "写注册表失败（不影响使用）：$($_.Exception.Message)" }
+
+# 旧备份只留最近 3 份，别把安装目录堆满
+try {
+  $olds = Get-ChildItem -LiteralPath $T -Directory -Filter '_升级备份_*' |
+          Sort-Object Name -Descending | Select-Object -Skip 3
+  if ($olds) { $olds | Remove-Item -Recurse -Force; Ok "清理了 $($olds.Count) 份旧备份（保留最近 3 份）" }
+} catch { }
+
+# 详细运行日志在安装目录留一份：现场出问题时只要把 _升级引擎运行日志.txt 发出来，
+# 就能看到每一步（谁派的进程、停服 PID、覆盖结果、校验结果、回滚原因）。
+try {
+  if (-not [string]::IsNullOrWhiteSpace($LogFile) -and (Test-Path -LiteralPath $LogFile)) {
+    $srcLog = [IO.Path]::GetFullPath($LogFile)
+    $dstLog = [IO.Path]::GetFullPath((Join-Path $T '_升级引擎运行日志.txt'))
+    if ($srcLog -ne $dstLog) { Copy-Item -LiteralPath $srcLog -Destination $dstLog -Force }
+  }
+} catch { }
+
+# 升级日志：结果一栏区分 成功 / 版本不符 / 失败已回滚，便于事后追溯
+try {
+  $log = Join-Path $T '_升级日志.txt'
+  if ($rolledBack) { $result = '失败已回滚' }
+  elseif ($live -eq $pkgVersion) { $result = '成功' }
+  elseif ($live) { $result = '版本不符' }
+  elseif ($NoRestart) { $result = '未重启' }
+  else { $result = '服务未起' }
+  $line = "{0}  {1}  ->  {2}  [{3}]  端口={4}  目录={5}  备份={6}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $oldVersion, $pkgVersion, $result, $PORT, $T, (Split-Path $backup -Leaf)
+  Add-Content -LiteralPath $log -Value $line -Encoding UTF8
+} catch { }
+
+Say ''
+if ($rolledBack) {
+  Say '  ============================================================' -c Red
+  Say '              升级未完成（已自动回滚，服务仍可用）' -c Red
+  Say '  ============================================================' -c Red
+  Say ''
+  Say "  旧版本：$oldVersion"
+  Say "  包版本：$pkgVersion（起不来，已放弃）"
+  Say "  备份  ：$backup"
+} elseif (-not $live -and -not $NoRestart) {
+  Say '  ============================================================' -c Red
+  Say '                        升级未完成' -c Red
+  Say '  ============================================================' -c Red
+  Say ''
+  Say '  请到这台机器上双击「启动.bat」，并查看 server.log'
+} else {
+  Say '  ============================================================' -c Green
+  Say '                        升级完成' -c Green
+  Say '  ============================================================' -c Green
+  Say ''
+  Say "  旧版本：$oldVersion"
+  Say "  新版本：$live"
+  Say "  备份  ：$backup"
+  Say ''
+  Say '  下一步：浏览器里按 Ctrl+Shift+R 强制刷新一次，即可看到新界面。' -c Yellow
+}
+Say ''
+
+if ($AutoOpen) { Start-Process "http://localhost:$PORT/" }
+if ($rolledBack) { exit 1 }

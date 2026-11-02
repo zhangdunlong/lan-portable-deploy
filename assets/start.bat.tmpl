@@ -1,0 +1,91 @@
+@echo off
+setlocal EnableExtensions
+
+REM 切换到本脚本所在目录，确保后续路径正确
+cd /d "%~dp0"
+
+REM ============================================================
+REM  端口：默认 {{DEFAULT_PORT}}（局域网内其他设备直接输 IP 即可，不用带端口号）
+REM  80 被占用时本脚本会提示，并允许临时改用 8080
+REM ============================================================
+set "PORT={{DEFAULT_PORT}}"
+set "DATA_DIR=%~dp0{{DATA_DIR}}"
+
+REM 优先使用自带便携运行时（{{RUNTIME_REL}}），实现「目标机零安装」
+set "RUN_EXE=%~dp0{{RUNTIME_REL}}"
+if exist "%RUN_EXE%" goto RUNNER_READY
+where {{RUNTIME_EXE_NAME}} >nul 2>nul
+if errorlevel 1 goto NO_RUNNER
+set "RUN_EXE={{RUNTIME_EXE_NAME}}"
+goto RUNNER_READY
+
+:NO_RUNNER
+echo ==============================================
+echo   未找到 {{RUNTIME_EXE_NAME}} 运行时！
+echo   请二选一：
+echo     1^) 把 {{RUNTIME_EXE_NAME}} 放到本目录的 {{RUNTIME_DIR}} 文件夹下（推荐，版本可控）
+echo     2^) 在本机安装 {{RUNTIME_EXE_NAME}} 后重开本脚本
+echo ==============================================
+pause
+exit /b 1
+
+:RUNNER_READY
+REM ---- 端口占用检查（80 在 Windows 上常被 http.sys / IIS 预留）----
+powershell -NoProfile -Command "try { (New-Object Net.Sockets.TcpClient).Connect('127.0.0.1', %PORT%); exit 0 } catch { exit 1 }" >nul 2>nul
+if not errorlevel 1 goto PORT_BUSY
+
+:PORT_OK
+REM 把实际使用的端口记下来，安装/升级引擎和停止脚本都靠它
+echo %PORT%> "%~dp0_port.txt"
+
+REM 确保数据目录存在
+if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
+
+REM 启动：有守护进程就先起守护（崩溃自动重启），没有就直接起应用
+if exist "%~dp0watchdog.js" (
+  wscript "%~dp0_run_hidden.vbs" "%RUN_EXE%" "%~dp0watchdog.js" "%~dp0{{ENTRY_FILE}}"
+) else (
+  wscript "%~dp0_run_hidden.vbs" "%RUN_EXE%" "%~dp0{{ENTRY_FILE}}"
+)
+
+REM 轮询等待端口可用（最多 20 秒）
+set /a tries=0
+:WAIT_LOOP
+  ping -n 1 -w 500 127.0.0.1 >nul
+  powershell -NoProfile -Command "try { (New-Object Net.Sockets.TcpClient).Connect('127.0.0.1', %PORT%); exit 0 } catch { exit 1 }" >nul 2>nul
+  if %errorlevel% == 0 goto PORT_READY
+  set /a tries+=1
+  if %tries% lss 20 goto WAIT_LOOP
+  echo.
+  echo   [注意] 服务在 20 秒内没有就绪，请查看本目录的 server.log。
+  echo.
+
+:PORT_READY
+REM 打开浏览器（本机访问）
+start "" "http://localhost:%PORT%/"
+
+REM 启动器窗口自动关闭，服务在后台无窗口运行
+REM 如需停止服务，请双击"停止.bat"
+exit
+
+:PORT_BUSY
+echo.
+echo ============================================================
+echo   端口 %PORT% 已被占用，无法启动。
+echo   占用它的进程：
+powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort %PORT% -State Listen -ErrorAction SilentlyContinue | ForEach-Object { $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue; '    PID {0,-7} {1}' -f $_.OwningProcess, $p.ProcessName }"
+echo.
+echo   处理办法（任选一种）：
+echo     1) 关掉上面的占用程序后重新双击本脚本
+echo        若是 IIS / World Wide Web 发布服务：管理员命令行执行  net stop http
+echo        查谁占了 80：netstat -ano ^| findstr :80
+echo     2) 直接按回车 —— 临时改用 8080 端口
+echo        注意：改用 8080 后，局域网其他设备要输  http://本机IP:8080/
+echo ============================================================
+echo.
+set "CH="
+set /p CH=按回车改用 8080，或关闭本窗口去释放 %PORT%：
+set "PORT=8080"
+echo.
+echo   已改用端口 8080。
+goto PORT_OK

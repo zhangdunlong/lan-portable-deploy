@@ -1,0 +1,19 @@
+@echo off
+chcp 936 >nul
+setlocal EnableExtensions
+title {{APP_NAME}} - 安装 / 升级
+
+REM 可选：把安装目录直接拖到本文件图标上运行 = 手动指定安装目录
+set "EQ_TARGET=%~1"
+
+echo.
+echo   ============================================================
+echo            {{APP_NAME}}   安装 / 升级
+echo   ============================================================
+echo.
+if defined EQ_TARGET echo   目标目录：%EQ_TARGET%
+echo   正在启动安装程序，请稍候...
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup.ps1"
+echo.
+pause
