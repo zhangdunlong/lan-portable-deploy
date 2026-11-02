@@ -228,7 +228,15 @@ def inspect_project(project, data_dir=None, static_dir=None):
                        'ok' if host in ('0.0.0.0', '::') else
                        'bad：绑在 %s 上局域网访问不到，改成 0.0.0.0 或删掉 host 参数' % host))
     else:
-        checks.append(('绑定地址', '未显式指定（多数框架默认 0.0.0.0）', 'warn：确认局域网其他电脑能打开'))
+        # 再查一层：HOST 常量 / uvicorn host= / app.run(host=) 里写成回环地址
+        _, hloop = grep_any(project, files,
+                            r"""(?:host|HOST|Host)\s*[:=]\s*['"](?:127\.0\.0\.1|localhost)['"]""")
+        if hloop:
+            checks.append(('绑定地址', '回环地址（127.0.0.1 / localhost）',
+                           'bad：绑在回环地址上，局域网其他电脑访问不到，改成 0.0.0.0'))
+        else:
+            checks.append(('绑定地址', '未显式指定（多数框架默认监听所有网卡）',
+                           'warn：本机能开、别人打不开时，先确认这里和防火墙'))
 
     _, pm = grep_any(project, files, r"""['"]/api/version['"]""")
     checks.append(('/api/version', '有' if pm else '没有',
