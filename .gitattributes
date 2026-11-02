@@ -1,0 +1,7 @@
+# 统一按 LF 入库：模板文件由构建脚本在写盘时决定 CRLF（.bat）或 BOM（.ps1），
+# 仓库里保持 LF 才能跨平台协作，避免 autocrlf 造成的假 diff。
+* text=auto eol=lf
+*.exe binary
+*.png binary
+*.jpg binary
+*.zip binary
