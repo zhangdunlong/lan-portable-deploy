@@ -10,7 +10,7 @@
 
 | 现场真实症状 | 本项目的处理 |
 |---|---|
-| 目标机没装 Node/Python，装也装不对版本 | 自带便携运行时 `runtime/`，目标机零安装 |
+| 目标机没装 Node/Python，也上不了网 | **默认自带便携运行时**，U 盘拷过去双击即用 |
 | 本机能开，别的电脑打不开 | 绑 `0.0.0.0` + 一键放行防火墙 + 默认 80 端口（免写端口号） |
 | 访问地址要带 `:8787`，现场记不住 | 默认 80，别的电脑只输 `http://本机IP/` |
 | 服务崩一次就彻底失联，等人来双击 | `watchdog.js` 守护：崩溃 2 秒后自动重启 + 日志轮转 + 反复崩溃止损 |
@@ -26,8 +26,10 @@
 # 1. 体检：判断项目能不能直接上局域网
 python scripts/mkportable.py inspect /path/to/your-project
 
-# 2. 构建（默认 80 端口；--full 会把便携运行时一起打进包）
-python scripts/mkportable.py build /path/to/your-project --out ./dist --name "我的系统" --full
+# 2. 构建（默认 80 端口，默认自带运行时 —— 目标机什么都不用装）
+python scripts/mkportable.py build /path/to/your-project --out ./dist --name "我的系统"
+#    找不到运行时时用 --runtime-exe <node.exe 路径> 指定；
+#    目标机已有运行时、想减小体积才加 --no-runtime
 
 # 3. 自检（build 已内置，也可单独跑）
 python scripts/mkportable.py verify ./dist

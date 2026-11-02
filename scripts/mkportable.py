@@ -12,7 +12,7 @@ mkportable.py —— 把任意 Web / 服务器项目打包成「Windows 便携 +
     │   ├── <static>/                    ← 静态资源
     │   ├── 启动.bat / 停止.bat / _run_hidden.vbs
     │   ├── version.txt
-    │   ├── runtime/                     ← 便携运行时（--full 时带上）
+    │   ├── runtime/                     ← 便携运行时（默认必带）
     │   ├── data/                        ← 空数据目录（永不进包）
     │   └── tools/deploy/_setup.ps1      ← 升级引擎（供以后接收远程升级）
     └── 部署包/
@@ -22,6 +22,8 @@ mkportable.py —— 把任意 Web / 服务器项目打包成「Windows 便携 +
 三个子命令：
     inspect <项目>                体检：识别入口/静态目录/数据目录/是否已具备局域网部署条件
     build   <项目> --out <目录>   生成安装目录 + zip + 单文件自解压 + 自检
+                                  默认自带运行时（U 盘拷到别的电脑双击就能跑）；
+                                  目标机已有运行时可用 --no-runtime 减小体积
     verify  <out 目录>            只做自检（不重新构建）
 
 设计红线（照抄实战项目的教训，别改）：
@@ -339,6 +341,8 @@ def build(args):
         'RUNTIME_DIR': os.path.dirname(runtime_rel).replace('/', '\\') or 'runtime',
         'RUNTIME_EXE_NAME': runtime_name,
         'REG_SLUG': reg_slug(app_name),
+        # 与 zip / 一键升级 .bat 的文件名保持一致（去掉前导 v，文件名里固定带 v）
+        'VERSION_TAG': re.sub(r'^[vV]', '', version),
     }
 
     out = os.path.abspath(args.out)
@@ -398,15 +402,43 @@ def build(args):
         shutil.copy2(hook, dst)
         copied.append('tools/deploy/post-upgrade.js（升级后钩子）')
 
-    # ③ 便携运行时
-    if args.full:
-        exe = os.path.join(project, runtime_rel.replace('\\', os.sep))
-        if os.path.isfile(exe):
-            os.makedirs(os.path.join(staging, 'runtime'), exist_ok=True)
-            shutil.copy2(exe, os.path.join(staging, 'runtime', os.path.basename(exe)))
-            copied.append('%s（完整包）' % runtime_rel)
+    # ③ 便携运行时（默认必带 —— 目标是「U 盘拷到别的电脑双击就能跑」，目标机可能什么都没有）
+    bundled = False
+    if args.no_runtime:
+        print('  [注意] --no-runtime：不带运行时，目标机必须自备 %s' % runtime_name)
+    else:
+        exe_src = ''
+        if args.runtime_exe and os.path.isfile(args.runtime_exe):
+            exe_src = args.runtime_exe
+        elif os.path.isfile(os.path.join(project, runtime_rel.replace('\\', os.sep))):
+            exe_src = os.path.join(project, runtime_rel.replace('\\', os.sep))
         else:
-            print('  [警告] --full 指定了完整包，但找不到 %s' % runtime_rel)
+            # 兜底查找顺序：PATH → 环境变量 → 常见安装位置
+            cands = [shutil.which(runtime_name)]
+            if runtime_name == 'node':
+                if os.environ.get('NODE_EXE'):
+                    cands.append(os.environ['NODE_EXE'])
+                for base in (os.environ.get('ProgramFiles'), os.environ.get('ProgramFiles(x86)'),
+                             os.environ.get('LOCALAPPDATA')):
+                    if base:
+                        cands.append(os.path.join(base, 'nodejs', 'node.exe'))
+                        cands.append(os.path.join(base, 'Programs', 'nodejs', 'node.exe'))
+            for c in cands:
+                if c and os.path.isfile(c):
+                    exe_src = c
+                    break
+        if exe_src:
+            os.makedirs(os.path.join(staging, os.path.dirname(runtime_rel).replace('/', os.sep) or 'runtime'),
+                        exist_ok=True)
+            dst_exe = os.path.join(staging, runtime_rel.replace('\\', os.sep))
+            shutil.copy2(exe_src, dst_exe)
+            bundled = True
+            copied.append('%s（%.1f MB，目标机免安装 %s）'
+                          % (runtime_rel, os.path.getsize(dst_exe) / 1048576.0, runtime_name))
+        else:
+            raise SystemExit('[错误] 找不到 %s 可执行文件，无法做成「拷过去就能跑」的包。\n'
+                             '  二选一：① 用 --runtime-exe <路径> 指定一个 %s.exe\n'
+                             '            ② 明确接受目标机自备运行时时加 --no-runtime' % (runtime_name, runtime_name))
 
     # ④ 运行时外壳（编码是硬约束）
     write_text(os.path.join(staging, '启动.bat'), render('start.bat.tmpl', mapping), 'gbk')
@@ -430,9 +462,10 @@ def build(args):
 
     # ⑥ 版本与说明
     write_text(os.path.join(staging, 'version.txt'), '%s\n%s\n' % (version, version_date), 'utf-8')
-    runtime_tip = ('本包为完整包，已含 %s，目标机不需要另装运行时。' % runtime_rel
-                   if args.full else
-                   '本包不含运行时。若目标机 %s 缺失，请先把它放进安装目录再升级。' % runtime_rel)
+    runtime_tip = ('本包已自带 %s，目标机不需要安装任何东西，U 盘拷过去双击「启动.bat」即可。' % runtime_rel
+                   if bundled else
+                   '本包【不含】运行时：目标机必须自备 %s，否则双击「启动.bat」会提示缺少运行时。'
+                   % runtime_name)
     write_text(os.path.join(staging, '安装说明.txt'),
                render('readme.txt.tmpl', dict(mapping, **{
                    'VERSION': version, 'VDATE': version_date, 'STAMP': stamp,
@@ -448,7 +481,7 @@ def build(args):
     os.makedirs(dist, exist_ok=True)
     safe = slugify(app_name)
     # 文件名里的版本不带前导 v（version.txt 里保留 APP_VERSION 原样，引擎要靠它做等值比较）
-    vtag = re.sub(r'^[vV]', '', version)
+    vtag = mapping['VERSION_TAG']
     zip_path = os.path.join(dist, '%s_升级包_v%s_%s.zip' % (safe, vtag, stamp))
     bat_path = os.path.join(dist, '%s_一键升级_v%s_%s.bat' % (safe, vtag, stamp))
     if args.no_zip:
@@ -744,15 +777,18 @@ def main():
     sub = ap.add_subparsers(dest='cmd', required=True)
 
     p1 = sub.add_parser('inspect', help='体检项目，判断能否直接上局域网')
-    p1.add_argument('project')
+    p1.add_argument('project', nargs='?', default='.',
+                    help='项目目录；省略 = 当前目录（技能默认就处理当前项目）')
     p1.add_argument('--data', help='手动指定数据目录名')
     p1.add_argument('--static', help='手动指定静态目录名')
     p1.add_argument('--json', action='store_true', help='输出 JSON（给程序用）')
     p1.set_defaults(func=cmd_inspect)
 
     p2 = sub.add_parser('build', help='构建安装目录 + 部署包')
-    p2.add_argument('project')
-    p2.add_argument('--out', required=True, help='输出目录')
+    p2.add_argument('project', nargs='?', default='.',
+                    help='项目目录；省略 = 当前目录（技能默认就处理当前项目）')
+    p2.add_argument('--out', required=True,
+                    help='输出目录（必须由用户指定：产物含运行时，几十 MB，放错地方既占空间又难找）')
     p2.add_argument('--name', help='显示名（默认取项目目录名）')
     p2.add_argument('--port', default='80', help='对外服务端口（默认 80，局域网其他设备不用带端口号）')
     p2.add_argument('--entry', help='入口文件名（默认自动识别）')
@@ -761,7 +797,10 @@ def main():
     p2.add_argument('--runtime', help='便携运行时相对路径（默认 runtime\\node.exe）')
     p2.add_argument('--type', choices=['node', 'static', 'python'], help='项目类型（默认自动识别）')
     p2.add_argument('--version', help='覆盖版本号（默认从入口文件 APP_VERSION 读）')
-    p2.add_argument('--full', action='store_true', help='把便携运行时也打进包')
+    p2.add_argument('--runtime-exe', help='指定要打进包的运行时可执行文件（默认自动找：项目 runtime/ → PATH 里的同名可执行文件）')
+    p2.add_argument('--no-runtime', action='store_true',
+                    help='不带运行时（默认会带，因为目标是 U 盘拷到别的电脑就能跑）')
+    p2.add_argument('--full', action='store_true', help='（兼容保留）现在默认就带运行时，此参数无效果')
     p2.add_argument('--no-zip', action='store_true', help='只生成安装目录，不打 zip')
     p2.set_defaults(func=build)
 
