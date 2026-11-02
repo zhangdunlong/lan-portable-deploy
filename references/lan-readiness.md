@@ -12,15 +12,15 @@
 
 ```js
 // Node 原生 http —— 原来
-server.listen(8787);
-server.listen(8787, '127.0.0.1');        // ❌ 只能本机
+server.listen(80);
+server.listen(80, '127.0.0.1');        // ❌ 只能本机
 // 改后
-server.listen(8787, '0.0.0.0');          // ✅ 所有网卡
+server.listen(80, '0.0.0.0');          // ✅ 所有网卡
 ```
 
 ```js
 // Express
-app.listen(8787, '0.0.0.0');
+app.listen(80, '0.0.0.0');
 ```
 
 ```python

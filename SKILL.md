@@ -17,9 +17,11 @@ agent_created: true
 | 访问不了 | 本机能开、别的电脑打不开 | 绑 `0.0.0.0` + 防火墙放行 + **默认 80 端口**（不用记端口号） |
 | 跑了会死 | 崩一次就彻底失联，等人来双击 | 守护进程自动重启 + 日志落盘 + 开机自启 |
 
+**运行前提**：本技能自身需要 Python 3（跑 `mkportable.py`），**产物不需要**——包里自带运行时，目标机什么都不装。
+
 **先判断再动手**：用户说"部署不了"时，绝大多数是后两条（绑定地址、防火墙），不是代码问题。先跑 `inspect` 拿证据，不要凭猜改代码。
 
-## 工作流（五步，别跳）
+## 工作流（六步，别跳；第 0 步是先问清，不是写代码）
 
 ### 第 0 步 · 只问这 3 件事（其余一律按默认做）
 
@@ -44,7 +46,8 @@ agent_created: true
 ### 第 1 步 · 体检（必须先做）
 
 ```bash
-python scripts/mkportable.py inspect <项目目录>
+python scripts/mkportable.py inspect            # 省略参数 = 当前目录
+python scripts/mkportable.py inspect D:\别的项目   # 指定时再带
 ```
 
 输出会直接告诉你哪几项不满足，`!!` 是必须改的，`~` 是建议确认的。关键判据：
@@ -61,13 +64,14 @@ python scripts/mkportable.py inspect <项目目录>
 ### 第 3 步 · 构建
 
 ```bash
-python scripts/mkportable.py build <项目目录> --out <输出目录> [--name 显示名] [--port 80]
+python scripts/mkportable.py build --out <输出目录> [--name 显示名] [--port 80]
+#  项目参数可省略（省略=当前目录）；--out 必须给，且要先问过用户
 ```
 
 **默认会把运行时打进包**——因为这套东西的主场景是「U 盘拷到别的电脑，双击就能用」，目标机可能连 Node 都没装、
 也上不了网。所以：
 
-- 自动找运行时：项目里的 `runtime/<exe>` → PATH 里的同名可执行文件
+- 自动找运行时，顺序：项目里的 `runtime/<exe>` → PATH → 环境变量 `NODE_EXE` → `Program Files`/`LocalAppData` 下的 nodejs
 - 找不到会**直接报错**（不静默降级），用 `--runtime-exe <路径>` 指定一个即可
 - 确实要在目标机自备运行时（省体积）才加 `--no-runtime`
 - 体积代价：Node 约 83 MB，zip 约 31 MB（压缩后）
@@ -92,6 +96,8 @@ python scripts/mkportable.py build <项目目录> --out <输出目录> [--name �
     ├── <名>_升级包_v<版本>_<日期>.zip
     └── <名>_一键升级_v<版本>_<日期>.bat   ← 单文件自解压，双击即装
 ```
+
+单独复查已生成的产物（不重新构建）：`python scripts/mkportable.py verify <输出目录>`
 
 构建内置自检，会拦下：结构缺失、`.bat` 不是 GBK/CRLF、`.ps1` 没有唯一 BOM、数据目录泄漏、模板占位符残留、payload 还原不一致。**自检不过就不要往下交付**。
 
@@ -143,6 +149,9 @@ python scripts/mkportable.py build <项目目录> --out <输出目录> [--name �
 | `assets/start.bat.tmpl` | 启动器：运行时探测、80 占用检测与回退、`_port.txt` 记录、守护拉起、自动开浏览器 |
 | `assets/stop.bat.tmpl` | 停止器：`_stop.flag` 信号 + 守护与子进程按序停止，避免"停了又起" |
 | `assets/watchdog.js` | 零依赖守护：崩溃 2 秒后重启、日志按 5MB 轮转、10 分钟内崩溃 20 次则放弃并留证 |
+| `assets/install.bat.tmpl` | 包内「安装.bat」：调 setup.ps1 的入口 |
+| `assets/readme.txt.tmpl` | 生成的「安装说明.txt」：给现场看的端口/防火墙/升级/日志位置说明 |
+| `assets/run_hidden.vbs` | 隐藏窗口启动器（纯 ASCII，避免 VBScript 编码问题） |
 | `assets/firewall.bat.tmpl` | 一键放行入站端口 + 程序（需管理员） |
 | `assets/autostart.bat.tmpl` | 开机自启（启动文件夹快捷方式），再点一次即取消 |
 | `assets/static-server.js` | 纯静态项目用的零依赖服务（含 `/api/version`、缓存策略、目录穿越防护） |

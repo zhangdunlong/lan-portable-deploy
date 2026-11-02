@@ -8,7 +8,7 @@
  *        ② 静态资源缓存策略 —— HTML 不缓存；带 ?v= 的资源长缓存
  *
  * 用法：
- *   node static-server.js [--dir .] [--port 8787] [--host 0.0.0.0]
+ *   node static-server.js [--dir .] [--port 80] [--host 0.0.0.0]
  *
  * 约定：
  *   · 版本号优先读同目录 version.txt 的第 1 行；没有则用下面的 FALLBACK_VERSION
@@ -28,7 +28,7 @@ function arg(name, def) {
 // 站点根目录：显式 --dir 优先；否则若同级有 public/ 就用 public/（与安装引擎的 {{STATIC_DIR}} 约定一致）
 const DEFAULT_DIR = fs.existsSync(path.join(__dirname, 'public')) ? path.join(__dirname, 'public') : __dirname;
 const ROOT = path.resolve(arg('dir', DEFAULT_DIR));
-const PORT = parseInt(arg('port', process.env.PORT || '8787'), 10);
+const PORT = parseInt(arg('port', process.env.PORT || '80'), 10);
 const HOST = arg('host', '0.0.0.0');
 
 function readVersion() {
